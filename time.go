@@ -104,6 +104,10 @@ func parseTimeMdhms(m, d, hms string) (t time.Time, e error) {
 	return
 }
 
+/*
+	DEPRECATED
+
+
 func getLineTime(line []byte) (t time.Time) {
 	t = time.Time{}
 	if !DateRe.Match(line) {
@@ -179,3 +183,4 @@ func getLineStartIndex(lines [][]byte, d time.Duration) (index int) {
 	index = i
 	return
 }
+*/
