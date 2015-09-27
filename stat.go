@@ -1,11 +1,12 @@
 package main
 
 import (
-	"bytes"
+	//"bytes"
 	//"encoding/json"
+	"bufio"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math"
 	"os"
 	"regexp"
@@ -13,9 +14,12 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"text/tabwriter"
 	"time"
 
 	"github.com/codegangsta/cli"
+	"github.com/fatih/color"
+	"github.com/olekukonko/tablewriter"
 )
 
 var (
@@ -30,25 +34,6 @@ var (
 	ErrParseEntry   = errors.New("Could not parse entry")
 	ErrParserClosed = errors.New("Parser is closed")
 )
-
-func padTo(v string, to int) string {
-	size := len(v)
-	diff := to - size
-	if diff < 0 {
-		return v
-	}
-	var sp int
-	var ep int
-	if diff%2 == 0 {
-		sp = diff / 2
-		ep = sp
-	} else {
-		n := float64(diff) / 2
-		sp = int(math.Floor(n))
-		ep = int(math.Ceil(n))
-	}
-	return fmt.Sprintf("%s%s%s", strings.Repeat(" ", sp), v, strings.Repeat(" ", ep))
-}
 
 type Entry struct {
 	Month         string    `json:"month"`
@@ -66,31 +51,28 @@ type Entry struct {
 	Time          time.Time `json:"time"`
 }
 
-func (e *Entry) Row(color bool) string {
-	// |date|ip|attempts|user|server|authenticated|invalidUser|protocol|port|
-	s := "|%s|%s|%s|%s|%s|%s|%s|%s|%s|"
+func (e *Entry) row() []string {
 	y, m, d := e.Time.Date()
-	date := padTo(fmt.Sprintf("%d/%d/%d", d, m, y), 12)
-	ip := padTo(e.Ip, 17)
-	attempts := padTo(fmt.Sprintf("%d", e.Attempts), 8)
-	user := padTo(e.User, 10)
-	authenticated := padTo(fmt.Sprintf("%t", e.Authenticated), 6)
-	invalidUser := padTo(fmt.Sprintf("%t", e.InvalidUser), 6)
-	protocol := padTo(e.Protocol, 6)
-	port := padTo(e.Port, 6)
-	return fmt.Sprintf(s, date, ip, attempts, user, authenticated, invalidUser,
-		protocol, port)
+	date := color.BlueString("%d/%d/%d", m, d, y)
+	ip := color.RedString("%s", e.Ip)
+	attempts := color.GreenString("%d", e.Attempts)
+	user := color.YellowString("%s", e.User)
+	auth := color.WhiteString("%s", e.AuthType)
+	proto := color.CyanString("%s", e.Protocol)
+	port := e.Port
+	server := e.Server
+	return []string{date, ip, attempts, user, auth, proto, port, server}
 }
 
-func parseEntry(line []byte) (entry *Entry, e error) {
+func parseEntry(line string) (entry *Entry, e error) {
 	var matches [][]string
 	var auth bool
 
-	if FailedRe.Match(line) {
-		matches = FailedRe.FindAllStringSubmatch(string(line), -1)
+	if FailedRe.MatchString(line) {
+		matches = FailedRe.FindAllStringSubmatch(line, -1)
 		auth = false
-	} else if AcceptedRe.Match(line) {
-		matches = AcceptedRe.FindAllStringSubmatch(string(line), -1)
+	} else if AcceptedRe.MatchString(line) {
+		matches = AcceptedRe.FindAllStringSubmatch(line, -1)
 		auth = true
 	} else {
 		e = ErrParseEntry
@@ -162,17 +144,17 @@ type Results struct {
 	Attempts         int
 	FailedAttempts   int
 	AcceptedAttempts int
-	Failed           []*Entry
-	Accepted         []*Entry
+	Failed           Entries
+	Accepted         Entries
+	Ips              []string
 
 	entries map[string]*Entry
-	Ips     []string
 }
 
 func newResults() *Results {
 	return &Results{
-		Failed:   []*Entry{},
-		Accepted: []*Entry{},
+		Failed:   Entries{},
+		Accepted: Entries{},
 		entries:  map[string]*Entry{},
 		Ips:      []string{},
 	}
@@ -213,64 +195,77 @@ func (r *Results) generateUniqueIps() {
 	}
 }
 
-func (r *Results) rows(entries []*Entry) string {
-	a := make([]string, len(entries))
+func (r *Results) writeEntries(entries Entries) {
 	for i := 0; i < len(entries); i++ {
-		a[i] = entries[i].Row(false)
+		fmt.Fprintln(r.tw, entries[i].row())
 	}
-	return strings.Join(a, "\n")
 }
 
-func (r *Results) String() string {
-	sort.Sort(Entries(r.Accepted))
-	sort.Sort(Entries(r.Failed))
-	accepted := r.rows(r.Accepted)
-	failed := r.rows(r.Failed)
-	r.generateUniqueIps()
-	s := `
-total attempts: %d
-accepted attempts: %d
-failed attempts: %d
-accepted:
-%s
-failed:
-%s
-ips:
-%s`
-
-	return fmt.Sprintf(s, r.Attempts, r.AcceptedAttempts,
-		r.FailedAttempts, accepted, failed, strings.Join(r.Ips, "\n"))
+func (r *Results) writeRows(t *tablewriter.Table, entries Entries) {
+	for _, e := range entries {
+		err := t.Append(e.Row())
+		if err != nil {
+			fmt.Println("Table Error:", err)
+		}
+	}
 }
 
-func (r *Results) ColorString() string {
-	return "colored results"
+func (r *Results) render() {
+	sort.Sort(r.Accepted)
+	sort.Sort(r.Failed)
+	headers := []string{"Date", "Ip", "Attempts", "User", "Auth", "Protocol", "Port", "Server"}
+
+	failed := tablewriter.NewWriter(os.Stdout)
+	failed.SetHeader(headers)
+	r.writeRows(failed, r.Failed)
+	failed.Render()
+
+	//r.writeHeader()
+	//r.tw.Init(os.Stdout, 0, 0, 0, ' ', 0)
+	//r.tw.Init(os.Stdout, 5, 0, 1, ' ', tabwriter.AlignRight)
+	//r.writeHeader()
+	//fmt.Println("Failed: \n")
+	//r.writeEntries(r.Failed)
+	//r.tw.Flush()
+	/*
+		fmt.Println("Accepted: \n")
+		r.writeHeader()
+		r.writeEntries(r.Accepted)
+		r.tw.Flush()
+	*/
 }
 
 type Parser struct {
 	concurrency int
 	sem         chan struct{}
-	input       [][]byte
+	r           io.Reader
+	s           *bufio.Scanner
+	after       time.Time
 	results     *Results
 
 	closed bool
 }
 
-func NewParser(concurrency int, input [][]byte) *Parser {
+func NewParser(concurrency int, r io.Reader, after time.Time, results *Results) *Parser {
 	return &Parser{
 		concurrency: concurrency,
 		sem:         make(chan struct{}, concurrency),
-		input:       input,
+		r:           r,
+		s:           bufio.NewScanner(r),
+		after:       after,
 		closed:      false,
-		results:     newResults(),
+		results:     results,
 	}
 }
 
-func (p *Parser) parseLine(line []byte) {
+func (p *Parser) parseLine(line string) {
 	entry, err := parseEntry(line)
 	if err != nil {
 		return
 	}
-	p.results.AddEntry(entry)
+	if entry.Time.After(p.after) {
+		p.results.AddEntry(entry)
+	}
 }
 
 func (p *Parser) run() error {
@@ -278,14 +273,15 @@ func (p *Parser) run() error {
 		return ErrParserClosed
 	}
 	wg := sync.WaitGroup{}
-	for i := 0; i < len(p.input); i++ {
+
+	for p.s.Scan() {
 		p.sem <- struct{}{}
-		go func(line []byte) {
+		go func(line string) {
 			wg.Add(1)
 			p.parseLine(line)
 			wg.Done()
 			<-p.sem
-		}(p.input[i])
+		}(p.s.Text())
 	}
 	close(p.sem)
 	wg.Wait()
@@ -305,36 +301,39 @@ func sshStat(c *cli.Context) {
 	//accepted := c.Bool("accepted")
 	//failed := c.Bool("failed")
 	cpus := c.Int("cpus")
-
-	data, err := ioutil.ReadFile(inputFile)
+	//
+	f, err := os.Open(inputFile)
+	defer f.Close()
 	if err != nil {
 		panic(err)
 	}
-	lines := bytes.Split(data, []byte("\n"))
-	sIndex := 0
 	if afterDuration == "" {
 		afterDuration = fmt.Sprintf("%dd%dh%dm%ds", days, hours, mins, secs)
 	}
-	if afterDuration != "" {
-		d, err := parseDuration(afterDuration)
-		if err != nil && int(d) != 0 {
-			sIndex = getLineStartIndex(lines, d)
-		}
+	d, err := parseDuration(afterDuration)
+	if err != nil {
+		panic(err)
 	}
-	lines = lines[sIndex:]
+	var after time.Time
+	if time.Duration(0) == d {
+		after = time.Time{}
+	} else {
+		after = time.Now().Add(-1 * d)
+	}
 	if cpus < 1 {
 		cpus = runtime.NumCPU()
 	}
 	runtime.GOMAXPROCS(cpus)
 	concurrency := 5 * cpus
 
-	parser := NewParser(concurrency, lines)
+	results := newResults()
+
+	parser := NewParser(concurrency, f, after, results)
 	err = parser.run()
 	if err != nil {
 		panic(err)
 	}
-	results := parser.results
-	fmt.Printf("%s\n", results)
+	results.render()
 }
 
 /*
