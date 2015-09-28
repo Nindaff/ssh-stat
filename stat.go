@@ -1,239 +1,16 @@
 package main
 
 import (
-	//"bytes"
-	//"encoding/json"
 	"bufio"
-	"errors"
 	"fmt"
 	"io"
-	"math"
 	"os"
-	"regexp"
 	"runtime"
-	"sort"
-	"strings"
 	"sync"
-	"text/tabwriter"
 	"time"
 
 	"github.com/codegangsta/cli"
-	"github.com/fatih/color"
-	"github.com/olekukonko/tablewriter"
 )
-
-var (
-	FailedRe = regexp.MustCompile(
-		`(\w{3})\s(\d{2})\s(\d{2}:\d{2}:\d{2})\s(\w+)\ssshd\[\d+\]\:\sFailed\s(\w+)\sfor\s([\w\s]+)\sfrom\s([\d\.]+)\sport\s(\d{1,5})\s([\w\d]+)`)
-	AcceptedRe = regexp.MustCompile(
-		`(\w{3})\s(\d{2})\s(\d{2}:\d{2}:\d{2})\s(\w+)\ssshd\[\d+\]\:\sAccepted\s(\w+)\sfor\s([\w\s]+)\sfrom\s([\d\.]+)\sport\s(\d{1,5})\s([\w\d]+)`)
-	InvalidUserRe = regexp.MustCompile(`invalid\suser\s(\w+)`)
-)
-
-var (
-	ErrParseEntry   = errors.New("Could not parse entry")
-	ErrParserClosed = errors.New("Parser is closed")
-)
-
-type Entry struct {
-	Month         string    `json:"month"`
-	Day           string    `json:"day"`
-	Hms           string    `json:"hms"`
-	Server        string    `json:"server"`
-	AuthType      string    `json:"authType"`
-	User          string    `json:"user"`
-	Ip            string    `json:"ip"`
-	Port          string    `json:"port"`
-	Protocol      string    `json:"protocol"`
-	InvalidUser   bool      `json:"invalidUser"`
-	Authenticated bool      `json:"authenticated"`
-	Attempts      int       `json:"attempts"`
-	Time          time.Time `json:"time"`
-}
-
-func (e *Entry) row() []string {
-	y, m, d := e.Time.Date()
-	date := color.BlueString("%d/%d/%d", m, d, y)
-	ip := color.RedString("%s", e.Ip)
-	attempts := color.GreenString("%d", e.Attempts)
-	user := color.YellowString("%s", e.User)
-	auth := color.WhiteString("%s", e.AuthType)
-	proto := color.CyanString("%s", e.Protocol)
-	port := e.Port
-	server := e.Server
-	return []string{date, ip, attempts, user, auth, proto, port, server}
-}
-
-func parseEntry(line string) (entry *Entry, e error) {
-	var matches [][]string
-	var auth bool
-
-	if FailedRe.MatchString(line) {
-		matches = FailedRe.FindAllStringSubmatch(line, -1)
-		auth = false
-	} else if AcceptedRe.MatchString(line) {
-		matches = AcceptedRe.FindAllStringSubmatch(line, -1)
-		auth = true
-	} else {
-		e = ErrParseEntry
-		return
-	}
-
-	m := matches[0]
-	if len(m) < 10 {
-		e = ErrParseEntry
-		return
-	}
-	/*
-	   Month = m[1]
-	   Day = m[2]
-	   Time = m[3]
-	   Server = m[4]
-	   AuthType = m[5]
-	   User = m[6]
-	   Ip = m[7]
-	   Port = m[8]
-	   Protocol = m[9]
-	*/
-
-	entry = &Entry{
-		Month:         m[1],
-		Day:           m[2],
-		Hms:           m[3],
-		Server:        m[4],
-		AuthType:      m[5],
-		User:          m[6],
-		Ip:            m[7],
-		Port:          m[8],
-		Protocol:      m[9],
-		Authenticated: auth,
-		Attempts:      1,
-	}
-
-	if InvalidUserRe.MatchString(entry.User) {
-		entry.InvalidUser = true
-		um := InvalidUserRe.FindAllStringSubmatch(entry.User, -1)
-		if len(um) > 0 && len(um[0]) > 1 {
-			entry.User = um[0][1]
-		}
-	}
-
-	entry.Time, _ = parseTimeMdhms(entry.Month, entry.Day, entry.Hms)
-	return
-}
-
-type Entries []*Entry
-
-func (entries Entries) Len() int {
-	return len(entries)
-}
-
-func (entries Entries) Swap(i, j int) {
-	entries[i], entries[j] = entries[j], entries[i]
-}
-
-// Less is more, default sort will be to show entries with
-// attempts for most to least
-func (entries Entries) Less(i, j int) bool {
-	return entries[i].Attempts > entries[j].Attempts
-}
-
-type Results struct {
-	sync.Mutex
-
-	Attempts         int
-	FailedAttempts   int
-	AcceptedAttempts int
-	Failed           Entries
-	Accepted         Entries
-	Ips              []string
-
-	entries map[string]*Entry
-}
-
-func newResults() *Results {
-	return &Results{
-		Failed:   Entries{},
-		Accepted: Entries{},
-		entries:  map[string]*Entry{},
-		Ips:      []string{},
-	}
-}
-
-func (r *Results) AddEntry(entry *Entry) {
-	r.Lock()
-	defer r.Unlock()
-
-	ip := entry.Ip
-	existingEntry, exists := r.entries[ip]
-	if exists {
-		existingEntry.Attempts++
-		if entry.Authenticated == existingEntry.Authenticated {
-			return
-		} else {
-			entry.Attempts = existingEntry.Attempts
-		}
-	} else {
-		r.entries[ip] = entry
-	}
-	if entry.Authenticated {
-		r.Accepted = append(r.Accepted, entry)
-	} else {
-		r.Failed = append(r.Failed, entry)
-	}
-}
-
-func (r *Results) generateUniqueIps() {
-	r.Lock()
-	defer r.Unlock()
-
-	r.Ips = make([]string, len(r.entries))
-	i := 0
-	for ip := range r.entries {
-		r.Ips[i] = ip
-		i++
-	}
-}
-
-func (r *Results) writeEntries(entries Entries) {
-	for i := 0; i < len(entries); i++ {
-		fmt.Fprintln(r.tw, entries[i].row())
-	}
-}
-
-func (r *Results) writeRows(t *tablewriter.Table, entries Entries) {
-	for _, e := range entries {
-		err := t.Append(e.Row())
-		if err != nil {
-			fmt.Println("Table Error:", err)
-		}
-	}
-}
-
-func (r *Results) render() {
-	sort.Sort(r.Accepted)
-	sort.Sort(r.Failed)
-	headers := []string{"Date", "Ip", "Attempts", "User", "Auth", "Protocol", "Port", "Server"}
-
-	failed := tablewriter.NewWriter(os.Stdout)
-	failed.SetHeader(headers)
-	r.writeRows(failed, r.Failed)
-	failed.Render()
-
-	//r.writeHeader()
-	//r.tw.Init(os.Stdout, 0, 0, 0, ' ', 0)
-	//r.tw.Init(os.Stdout, 5, 0, 1, ' ', tabwriter.AlignRight)
-	//r.writeHeader()
-	//fmt.Println("Failed: \n")
-	//r.writeEntries(r.Failed)
-	//r.tw.Flush()
-	/*
-		fmt.Println("Accepted: \n")
-		r.writeHeader()
-		r.writeEntries(r.Accepted)
-		r.tw.Flush()
-	*/
-}
 
 type Parser struct {
 	concurrency int
@@ -268,7 +45,7 @@ func (p *Parser) parseLine(line string) {
 	}
 }
 
-func (p *Parser) run() error {
+func (p *Parser) Run() error {
 	if p.closed {
 		return ErrParserClosed
 	}
@@ -296,10 +73,12 @@ func sshStat(c *cli.Context) {
 	hours := c.Int("hours")
 	mins := c.Int("mins")
 	secs := c.Int("secs")
+	orderExp := c.String("order")
 	//colors := c.Bool("colors")
-	//showIps := c.Bool("ips")
-	//accepted := c.Bool("accepted")
-	//failed := c.Bool("failed")
+	ipOutput := c.Bool("ips")
+	acceptedOutput := c.Bool("accepted")
+	failedOutput := c.Bool("failed")
+	jsonOutput := c.Bool("json")
 	cpus := c.Int("cpus")
 	//
 	f, err := os.Open(inputFile)
@@ -326,30 +105,48 @@ func sshStat(c *cli.Context) {
 	runtime.GOMAXPROCS(cpus)
 	concurrency := 5 * cpus
 
-	results := newResults()
+	order := parseOrderBy(orderExp)
+	if order == Order_Error {
+		fmt.Println("Order expession could not be interpreted")
+		os.Exit(1)
+	}
+
+	results := newResults(order)
+	if acceptedOutput && !failedOutput {
+		results.failedOutput = false
+	}
+	if failedOutput && !acceptedOutput {
+		results.acceptedOutput = false
+	}
+	if ipOutput {
+		results.ipOutput = true
+	}
+	if jsonOutput {
+		results.jsonOutput = true
+	}
 
 	parser := NewParser(concurrency, f, after, results)
-	err = parser.run()
+	err = parser.Run()
 	if err != nil {
 		panic(err)
 	}
-	results.render()
+	results.Render()
 }
 
 /*
 
-	log-file?
-	after
-	days
-	hours
-	mins
-	secs
-	colors
-	ips
-	failed
-	accepted
-	concurrency
-	cpu
+  log-file?
+  after
+  days
+  hours
+  mins
+  secs
+  colors
+  ips
+  failed
+  accepted
+  concurrency
+  cpu
 
 */
 
@@ -394,7 +191,7 @@ func main() {
 		},
 		cli.BoolFlag{
 			Name:  "ips",
-			Usage: "Output ip addresses only",
+			Usage: "Only display ip addresses",
 		},
 		cli.BoolFlag{
 			Name:  "accepted",
@@ -408,6 +205,11 @@ func main() {
 			Name:  "cpu",
 			Value: 0,
 			Usage: "Set max cpu usage",
+		},
+		cli.StringFlag{
+			Name:  "order",
+			Value: "attemptsDesc",
+			Usage: "Order results, (attemptsAsc, attemptsDesc, chronoAsc, chronoDesc)",
 		},
 	}
 	app.Action = sshStat
